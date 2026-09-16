@@ -40,6 +40,7 @@ def read_pems_wide(
     *,
     chunksize: int = 500_000,
     max_raw_rows: int | None = None,
+    station_limit: int | None = None,
 ) -> pd.DataFrame:
     """Read the long CSV in two streaming passes and return ``[T, N]`` flow data.
 
@@ -49,7 +50,9 @@ def read_pems_wide(
     numerical order and the index is chronological.
 
     ``max_raw_rows`` is intended for smoke tests.  It limits both passes to the
-    same leading records and is not used in normal training.
+    same leading records and is not used in normal training.  ``station_limit``
+    selects the lowest numeric station IDs, while retaining all timestamps; it
+    is useful for an end-to-end mini-training run.
     """
     path = Path(csv_path)
     if not path.is_file():
@@ -58,6 +61,8 @@ def read_pems_wide(
         raise ValueError("chunksize must be positive")
     if max_raw_rows is not None and max_raw_rows <= 0:
         raise ValueError("max_raw_rows must be positive when provided")
+    if station_limit is not None and station_limit <= 0:
+        raise ValueError("station_limit must be positive when provided")
 
     timestamps: set[str] = set()
     station_ids: set[str] = set()
@@ -73,6 +78,8 @@ def read_pems_wide(
         key=lambda value: pd.to_datetime(value, format=TIME_FORMAT, errors="raise"),
     )
     ordered_station_ids = sorted(station_ids, key=_station_sort_key)
+    if station_limit is not None:
+        ordered_station_ids = ordered_station_ids[:station_limit]
     time_positions = {timestamp: index for index, timestamp in enumerate(ordered_timestamps)}
     station_positions = {
         station_id: index for index, station_id in enumerate(ordered_station_ids)
@@ -181,6 +188,7 @@ def load_pems_datasets(
     *,
     chunksize: int = 500_000,
     max_raw_rows: int | None = None,
+    station_limit: int | None = None,
     input_steps: int = INPUT_STEPS,
     forecast_steps: int = FORECAST_STEPS,
     stride: int = STRIDE,
@@ -192,7 +200,10 @@ def load_pems_datasets(
     validation and test data.
     """
     wide = read_pems_wide(
-        csv_path, chunksize=chunksize, max_raw_rows=max_raw_rows
+        csv_path,
+        chunksize=chunksize,
+        max_raw_rows=max_raw_rows,
+        station_limit=station_limit,
     )
     total_steps = len(wide)
     train_end = int(total_steps * 0.70)

@@ -71,11 +71,15 @@ def create_pems_dataloaders(
     batch_size: int = 32,
     chunksize: int = 500_000,
     max_raw_rows: int | None = None,
+    station_limit: int | None = None,
     seed: int | None = None,
 ) -> PemsDataLoaders:
     """Create chronological validation/test and shuffled training batch loaders."""
     datasets = load_pems_datasets(
-        csv_path, chunksize=chunksize, max_raw_rows=max_raw_rows
+        csv_path,
+        chunksize=chunksize,
+        max_raw_rows=max_raw_rows,
+        station_limit=station_limit,
     )
     return PemsDataLoaders(
         train=NumpyDataLoader(datasets.train, batch_size=batch_size, shuffle=True, seed=seed),
