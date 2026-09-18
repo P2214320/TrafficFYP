@@ -15,6 +15,7 @@ INPUT_STEPS = 288
 FORECAST_STEPS = 144
 STRIDE = 12
 RAW_COLUMNS = ["timestamp", "station_id", "flow"]
+STATION_METADATA_COLUMNS = ["station_id", "freeway", "dir", "abs_pm", "latitude", "longitude"]
 
 
 def _station_sort_key(station_id: str) -> tuple[int, int | str]:
@@ -23,25 +24,43 @@ def _station_sort_key(station_id: str) -> tuple[int, int | str]:
 
 
 def _read_chunks(
-    csv_path: Path, chunksize: int, max_raw_rows: int | None
+    csv_path: Path,
+    chunksize: int,
+    max_raw_rows: int | None,
+    *,
+    include_metadata: bool = False,
 ) -> Iterator[pd.DataFrame]:
     """Yield only the three columns needed to construct the flow matrix."""
+    usecols = RAW_COLUMNS if not include_metadata else list(
+        dict.fromkeys([*RAW_COLUMNS, *STATION_METADATA_COLUMNS])
+    )
+    dtypes: dict[str, str] = {"station_id": "string", "flow": "float32"}
+    if include_metadata:
+        dtypes.update(
+            {
+                "freeway": "string",
+                "dir": "string",
+                "abs_pm": "float32",
+                "latitude": "float32",
+                "longitude": "float32",
+            }
+        )
     yield from pd.read_csv(
         csv_path,
-        usecols=RAW_COLUMNS,
-        dtype={"station_id": "string", "flow": "float32"},
+        usecols=usecols,
+        dtype=dtypes,
         chunksize=chunksize,
         nrows=max_raw_rows,
     )
 
 
-def read_pems_wide(
+def _read_pems_wide_and_metadata(
     csv_path: str | Path,
     *,
     chunksize: int = 500_000,
     max_raw_rows: int | None = None,
     station_limit: int | None = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read the long CSV in two streaming passes and return ``[T, N]`` flow data.
 
     The first pass collects the small timestamp/station vocabularies.  The second
@@ -66,9 +85,21 @@ def read_pems_wide(
 
     timestamps: set[str] = set()
     station_ids: set[str] = set()
-    for chunk in _read_chunks(path, chunksize, max_raw_rows):
+    metadata_by_station: dict[str, tuple[str, str, float, float, float]] = {}
+    for chunk in _read_chunks(path, chunksize, max_raw_rows, include_metadata=True):
         timestamps.update(chunk["timestamp"].dropna().astype(str).unique())
         station_ids.update(chunk["station_id"].dropna().astype(str).unique())
+        static_rows = chunk[STATION_METADATA_COLUMNS].drop_duplicates("station_id")
+        for row in static_rows.itertuples(index=False):
+            station_id = str(row.station_id)
+            if station_id not in metadata_by_station:
+                metadata_by_station[station_id] = (
+                    str(row.freeway),
+                    str(row.dir),
+                    float(row.abs_pm),
+                    float(row.latitude),
+                    float(row.longitude),
+                )
 
     if not timestamps or not station_ids:
         raise ValueError("No timestamp/station records were found in the CSV")
@@ -104,7 +135,69 @@ def read_pems_wide(
         pd.to_datetime(ordered_timestamps, format=TIME_FORMAT, errors="raise"),
         name="timestamp",
     )
-    return pd.DataFrame(values, index=datetime_index, columns=ordered_station_ids)
+    metadata = pd.DataFrame(
+        [metadata_by_station.get(station_id, (np.nan,) * 5) for station_id in ordered_station_ids],
+        index=pd.Index(ordered_station_ids, name="station_id"),
+        columns=STATION_METADATA_COLUMNS[1:],
+    )
+    return pd.DataFrame(values, index=datetime_index, columns=ordered_station_ids), metadata
+
+
+def read_pems_wide(
+    csv_path: str | Path,
+    *,
+    chunksize: int = 500_000,
+    max_raw_rows: int | None = None,
+    station_limit: int | None = None,
+) -> pd.DataFrame:
+    """Read the long CSV in two streaming passes and return ``[T, N]`` flow data."""
+    return _read_pems_wide_and_metadata(
+        csv_path,
+        chunksize=chunksize,
+        max_raw_rows=max_raw_rows,
+        station_limit=station_limit,
+    )[0]
+
+
+def build_station_knn(metadata: pd.DataFrame, k: int = 8) -> np.ndarray:
+    """Build a fixed, sparse road-aware KNN graph with a self-loop in column 0."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+    required = {"freeway", "dir", "abs_pm", "latitude", "longitude"}
+    if missing := required.difference(metadata.columns):
+        raise ValueError(f"Station metadata is missing columns: {sorted(missing)}")
+
+    station_count = len(metadata)
+    if station_count < 2:
+        raise ValueError("At least two stations are required to build KNN neighbors")
+    neighbor_count = min(k, station_count - 1)
+    freeway = metadata["freeway"].astype(str).to_numpy()
+    direction = metadata["dir"].astype(str).to_numpy()
+    abs_pm = metadata["abs_pm"].to_numpy(dtype=np.float32)
+    latitude = metadata["latitude"].to_numpy(dtype=np.float32)
+    longitude = metadata["longitude"].to_numpy(dtype=np.float32)
+    all_indices = np.arange(station_count)
+    neighbors = np.empty((station_count, neighbor_count + 1), dtype=np.int64)
+
+    for index in range(station_count):
+        same_road = (freeway == freeway[index]) & (direction == direction[index])
+        same_road[index] = False
+        candidates = all_indices[same_road]
+        if len(candidates):
+            pm_distance = np.abs(abs_pm[candidates] - abs_pm[index])
+            candidates = candidates[np.argsort(np.nan_to_num(pm_distance, nan=np.inf))]
+
+        selected = list(candidates[:neighbor_count])
+        if len(selected) < neighbor_count:
+            remaining = np.setdiff1d(all_indices, np.array([index, *selected]), assume_unique=False)
+            geo_distance = (latitude[remaining] - latitude[index]) ** 2 + (
+                longitude[remaining] - longitude[index]
+            ) ** 2
+            nearest = remaining[np.argsort(np.nan_to_num(geo_distance, nan=np.inf))]
+            selected.extend(nearest[: neighbor_count - len(selected)].tolist())
+
+        neighbors[index] = np.asarray([index, *selected], dtype=np.int64)
+    return neighbors
 
 
 def _interpolate_within_split(values: np.ndarray) -> np.ndarray:
@@ -196,6 +289,8 @@ class PemsDatasetSplits:
     train_timestamps: pd.DatetimeIndex
     val_timestamps: pd.DatetimeIndex
     test_timestamps: pd.DatetimeIndex
+    station_metadata: pd.DataFrame
+    neighbor_indices: np.ndarray | None
 
 
 def load_pems_datasets(
@@ -204,6 +299,7 @@ def load_pems_datasets(
     chunksize: int = 500_000,
     max_raw_rows: int | None = None,
     station_limit: int | None = None,
+    knn_k: int | None = None,
     input_steps: int = INPUT_STEPS,
     forecast_steps: int = FORECAST_STEPS,
     stride: int = STRIDE,
@@ -214,7 +310,7 @@ def load_pems_datasets(
     fitted solely on the imputed training partition, then reused unchanged for
     validation and test data.
     """
-    wide = read_pems_wide(
+    wide, station_metadata = _read_pems_wide_and_metadata(
         csv_path,
         chunksize=chunksize,
         max_raw_rows=max_raw_rows,
@@ -231,6 +327,7 @@ def load_pems_datasets(
     test_values = _interpolate_within_split(wide.iloc[val_end:].to_numpy())
 
     scaler = FlowScaler.fit(train_values)
+    neighbor_indices = build_station_knn(station_metadata, knn_k) if knn_k else None
     return PemsDatasetSplits(
         train=PemsFlowDataset(
             scaler.transform(train_values),
@@ -258,4 +355,6 @@ def load_pems_datasets(
         train_timestamps=wide.index[:train_end],
         val_timestamps=wide.index[train_end:val_end],
         test_timestamps=wide.index[val_end:],
+        station_metadata=station_metadata,
+        neighbor_indices=neighbor_indices,
     )

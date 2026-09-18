@@ -180,3 +180,6 @@ data/
 *.csv
 *.h5
 *.txt
+
+models/
+*.pth

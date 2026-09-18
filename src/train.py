@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--station-limit", type=int, default=None, help="Use 5 for a mini run.")
+    parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=0,
+        help="Sparse road-neighbor count (experimental); use 8 to enable.",
+    )
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -108,7 +114,10 @@ def main() -> None:
 
     set_seed(args.seed)
     device = resolve_device(args.device)
-    datasets = load_pems_datasets(args.data_path, station_limit=args.station_limit)
+    knn_k = args.knn_k or None
+    datasets = load_pems_datasets(
+        args.data_path, station_limit=args.station_limit, knn_k=knn_k
+    )
     if not len(datasets.train) or not len(datasets.val):
         raise ValueError(
             "Train/validation windows are empty. Keep the full time range; a "
@@ -130,7 +139,9 @@ def main() -> None:
         "dim_feedforward": 512,
         "dropout": 0.1,
     }
-    model = build_traffic_transformer(**model_config).to(device)
+    model = build_traffic_transformer(
+        **model_config, neighbor_indices=datasets.neighbor_indices
+    ).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=1e-4
@@ -152,7 +163,7 @@ def main() -> None:
         {
             "model_state_dict": best_state,
             "model_config": model_config,
-            "data_config": {"station_limit": args.station_limit},
+            "data_config": {"station_limit": args.station_limit, "knn_k": knn_k},
             "station_ids": datasets.station_ids,
             "scaler_mean": datasets.scaler.mean,
             "scaler_std": datasets.scaler.std,
@@ -205,7 +216,7 @@ def main() -> None:
                 {
                     "model_state_dict": best_state,
                     "model_config": model_config,
-                    "data_config": {"station_limit": args.station_limit},
+                    "data_config": {"station_limit": args.station_limit, "knn_k": knn_k},
                     "station_ids": datasets.station_ids,
                     "scaler_mean": datasets.scaler.mean,
                     "scaler_std": datasets.scaler.std,

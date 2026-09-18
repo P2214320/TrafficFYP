@@ -105,6 +105,24 @@ class CrossAttentionForecastBlock(nn.Module):
         return x + self.ffn_dropout(self.ffn(self.ffn_norm(x)))
 
 
+class SparseKNNMixer(nn.Module):
+    """Append the mean flow of each station's fixed sparse road neighbors."""
+
+    def __init__(self, neighbor_indices: Tensor) -> None:
+        super().__init__()
+        indices = torch.as_tensor(neighbor_indices, dtype=torch.long)
+        if indices.ndim != 2 or indices.size(1) < 2:
+            raise ValueError("neighbor_indices must have shape [station, self_plus_neighbors]")
+        self.register_buffer("neighbor_indices", indices)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.size(-1) != self.neighbor_indices.size(0):
+            raise ValueError("KNN graph station count does not match model input")
+        neighbor_flows = inputs[:, :, self.neighbor_indices]
+        neighbor_mean = neighbor_flows.mean(dim=-1)
+        return torch.cat((inputs, neighbor_mean), dim=-1)
+
+
 class TrafficTransformer(nn.Module):
     """Encoder-only Transformer mapping ``[B, 288, 1913]`` to ``[B, 144, 1913]``."""
 
@@ -119,6 +137,7 @@ class TrafficTransformer(nn.Module):
         num_encoder_layers: int = 3,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
+        neighbor_indices: Tensor | None = None,
     ) -> None:
         super().__init__()
         if min(num_stations, input_steps, forecast_steps, num_encoder_layers) <= 0:
@@ -129,7 +148,11 @@ class TrafficTransformer(nn.Module):
         self.num_stations = num_stations
         self.input_steps = input_steps
         self.forecast_steps = forecast_steps
-        self.input_projection = nn.Linear(num_stations, d_model)
+        self.spatial_mixer = (
+            SparseKNNMixer(neighbor_indices) if neighbor_indices is not None else None
+        )
+        input_features = num_stations * (2 if self.spatial_mixer is not None else 1)
+        self.input_projection = nn.Linear(input_features, d_model)
         self.hour_embedding = nn.Embedding(24, 8)
         self.day_embedding = nn.Embedding(7, 4)
         self.time_projection = nn.Linear(12, d_model)
@@ -180,7 +203,8 @@ class TrafficTransformer(nn.Module):
                 f"got {tuple(inputs.shape)}"
             )
 
-        encoded = self.input_projection(inputs) + self._time_embedding(
+        spatial_features = self.spatial_mixer(inputs) if self.spatial_mixer is not None else inputs
+        encoded = self.input_projection(spatial_features) + self._time_embedding(
             past_time, self.input_steps
         )
         encoded = self.input_positional_encoding(encoded)
@@ -198,6 +222,6 @@ class TrafficTransformer(nn.Module):
         return seasonal_baseline + predicted_residual
 
 
-def build_traffic_transformer(**kwargs: int | float) -> TrafficTransformer:
+def build_traffic_transformer(**kwargs: object) -> TrafficTransformer:
     """Construct the traffic Transformer using the recommended compact defaults."""
     return TrafficTransformer(**kwargs)

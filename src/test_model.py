@@ -12,14 +12,17 @@ except ImportError:  # Supports `python src/test_model.py`.
 
 def main() -> None:
     torch.manual_seed(42)
-    model = build_traffic_transformer().eval()
-    inputs = torch.randn(2, 288, 1_913, dtype=torch.float32)
+    station_count = 1_913
+    offsets = torch.arange(9, dtype=torch.long)
+    neighbor_indices = (torch.arange(station_count).unsqueeze(1) + offsets) % station_count
+    model = build_traffic_transformer(neighbor_indices=neighbor_indices).eval()
+    inputs = torch.randn(2, 288, station_count, dtype=torch.float32)
     past_time = torch.randint(0, 168, (2, 288), dtype=torch.long)
     future_time = torch.randint(0, 168, (2, 144), dtype=torch.long)
     with torch.no_grad():
         outputs = model(inputs, past_time, future_time)
 
-    expected_shape = (2, 144, 1_913)
+    expected_shape = (2, 144, station_count)
     if tuple(outputs.shape) != expected_shape:
         raise AssertionError(f"Expected {expected_shape}, got {tuple(outputs.shape)}")
     seasonal_baseline = inputs[:, :144, :]

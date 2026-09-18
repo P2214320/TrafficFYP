@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the station limit stored in the checkpoint.",
     )
+    parser.add_argument("--knn-k", type=int, default=None, help="Override KNN neighbor count.")
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     return parser.parse_args()
 
@@ -47,13 +48,22 @@ def main() -> None:
         if args.station_limit is not None
         else checkpoint["data_config"]["station_limit"]
     )
-    datasets = load_pems_datasets(args.data_path, station_limit=station_limit)
+    knn_k = (
+        args.knn_k
+        if args.knn_k is not None
+        else checkpoint["data_config"].get("knn_k")
+    )
+    datasets = load_pems_datasets(
+        args.data_path, station_limit=station_limit, knn_k=knn_k
+    )
     if len(datasets.station_ids) != checkpoint["model_config"]["num_stations"]:
         raise ValueError("Dataset station count does not match the checkpoint")
     if not len(datasets.test):
         raise ValueError("The test split produced no windows")
 
-    model = build_traffic_transformer(**checkpoint["model_config"]).to(device)
+    model = build_traffic_transformer(
+        **checkpoint["model_config"], neighbor_indices=datasets.neighbor_indices
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     test_loader = NumpyDataLoader(datasets.test, batch_size=args.batch_size)
