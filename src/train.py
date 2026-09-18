@@ -55,23 +55,46 @@ def mean_loss(
 
     model.eval()
     total_loss = 0.0
+    total_elements = 0
     with torch.no_grad():
-        for features, targets in loader:
+        for features, targets, past_time, future_time in loader:
             features = torch.from_numpy(features).to(device, non_blocking=True)
             targets = torch.from_numpy(targets).to(device, non_blocking=True)
-            predictions = model(features)
-            total_loss += criterion(predictions, targets).item()
-    return total_loss / len(loader)
+            past_time = torch.from_numpy(past_time).to(device, non_blocking=True)
+            future_time = torch.from_numpy(future_time).to(device, non_blocking=True)
+            predictions = model(features, past_time, future_time)
+            total_loss += criterion(predictions, targets).item() * targets.numel()
+            total_elements += targets.numel()
+    return total_loss / total_elements
+
+
+def mean_seasonal_baseline_loss(
+    loader: NumpyDataLoader, criterion: nn.Module, device: torch.device
+) -> float:
+    """MSE of the 24-hour aligned baseline used by the residual model."""
+    if not len(loader):
+        raise ValueError("The validation split produced no windows")
+
+    total_loss = 0.0
+    total_elements = 0
+    with torch.no_grad():
+        for features, targets, _, _ in loader:
+            features = torch.from_numpy(features).to(device, non_blocking=True)
+            targets = torch.from_numpy(targets).to(device, non_blocking=True)
+            baseline = features[:, : targets.size(1), :]
+            total_loss += criterion(baseline, targets).item() * targets.numel()
+            total_elements += targets.numel()
+    return total_loss / total_elements
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4, help="Use 4 on a 6 GB RTX 3060.")
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--station-limit", type=int, default=None, help="Use 5 for a mini run.")
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -101,45 +124,78 @@ def main() -> None:
         "num_stations": len(datasets.station_ids),
         "input_steps": datasets.train.input_steps,
         "forecast_steps": datasets.train.forecast_steps,
-        "d_model": 64,
-        "nhead": 4,
-        "num_encoder_layers": 2,
-        "dim_feedforward": 256,
+        "d_model": 128,
+        "nhead": 8,
+        "num_encoder_layers": 3,
+        "dim_feedforward": 512,
         "dropout": 0.1,
     }
     model = build_traffic_transformer(**model_config).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.learning_rate, weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-6
+    )
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
-    best_val_loss = float("inf")
-    best_state: dict[str, torch.Tensor] | None = None
     epochs_without_improvement = 0
     amp_enabled = device.type == "cuda"
     gradient_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    baseline_val_loss = mean_seasonal_baseline_loss(val_loader, criterion, device)
+    # The zero-initialized residual head exactly reproduces the seasonal baseline.
+    # Preserve that safe checkpoint unless training genuinely improves on it.
+    best_val_loss = baseline_val_loss
+    best_state: dict[str, torch.Tensor] | None = deepcopy(model.state_dict())
+    torch.save(
+        {
+            "model_state_dict": best_state,
+            "model_config": model_config,
+            "data_config": {"station_limit": args.station_limit},
+            "station_ids": datasets.station_ids,
+            "scaler_mean": datasets.scaler.mean,
+            "scaler_std": datasets.scaler.std,
+            "best_val_mse": best_val_loss,
+        },
+        args.model_path,
+    )
 
     print(
         f"Device: {device}; stations: {len(datasets.station_ids)}; "
         f"train/val/test windows: {len(datasets.train)}/{len(datasets.val)}/{len(datasets.test)}"
     )
+    print(f"Validation seasonal-baseline MSE: {baseline_val_loss:.6f}")
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_train_loss = 0.0
-        for features, targets in train_loader:
+        total_train_elements = 0
+        for features, targets, past_time, future_time in train_loader:
             features = torch.from_numpy(features).to(device, non_blocking=True)
             targets = torch.from_numpy(targets).to(device, non_blocking=True)
+            past_time = torch.from_numpy(past_time).to(device, non_blocking=True)
+            future_time = torch.from_numpy(future_time).to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                predictions = model(features)
+                predictions = model(features, past_time, future_time)
                 loss = criterion(predictions, targets)
             gradient_scaler.scale(loss).backward()
+            gradient_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             gradient_scaler.step(optimizer)
             gradient_scaler.update()
-            total_train_loss += loss.item()
+            total_train_loss += loss.item() * targets.numel()
+            total_train_elements += targets.numel()
 
-        train_loss = total_train_loss / len(train_loader)
+        train_loss = total_train_loss / total_train_elements
         val_loss = mean_loss(model, val_loader, criterion, device)
-        print(f"Epoch {epoch:03d}: train_mse={train_loss:.6f}, val_mse={val_loss:.6f}")
+        scheduler.step(val_loss)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        print(
+            f"Epoch {epoch:03d}: train_mse={train_loss:.6f}, "
+            f"val_mse={val_loss:.6f}, baseline_mse={baseline_val_loss:.6f}, "
+            f"lr={learning_rate:.2e}"
+        )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -163,8 +219,6 @@ def main() -> None:
                 print(f"Early stopping after {args.patience} epochs without improvement.")
                 break
 
-    if best_state is None:
-        raise RuntimeError("No checkpoint was saved")
     print(f"Best validation MSE: {best_val_loss:.6f}")
     print(f"Saved checkpoint: {args.model_path}")
 

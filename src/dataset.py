@@ -134,11 +134,12 @@ class FlowScaler:
 
 
 class PemsFlowDataset:
-    """A strided, multi-station forecasting dataset backed by a ``float32`` array."""
+    """Windowed flows plus hour-of-week codes backed by contiguous arrays."""
 
     def __init__(
         self,
         values: np.ndarray,
+        timestamps: pd.DatetimeIndex,
         *,
         input_steps: int = INPUT_STEPS,
         forecast_steps: int = FORECAST_STEPS,
@@ -146,10 +147,19 @@ class PemsFlowDataset:
     ) -> None:
         if values.ndim != 2:
             raise ValueError("values must have shape [time, station]")
+        if len(values) != len(timestamps):
+            raise ValueError("timestamps must align one-to-one with values")
         if min(input_steps, forecast_steps, stride) <= 0:
             raise ValueError("input_steps, forecast_steps, and stride must be positive")
 
         self.values = np.ascontiguousarray(values, dtype=np.float32)
+        # One integer preserves the [time] contract while encoding both features:
+        # 0..23 = Monday hours, 24..47 = Tuesday hours, ..., 144..167 = Sunday.
+        self.time_codes = np.ascontiguousarray(
+            timestamps.dayofweek.to_numpy(dtype=np.int64) * 24
+            + timestamps.hour.to_numpy(dtype=np.int64),
+            dtype=np.int64,
+        )
         self.input_steps = input_steps
         self.forecast_steps = forecast_steps
         self.stride = stride
@@ -159,7 +169,7 @@ class PemsFlowDataset:
     def __len__(self) -> int:
         return self._length
 
-    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if index < 0:
             index += len(self)
         if index < 0 or index >= len(self):
@@ -168,7 +178,12 @@ class PemsFlowDataset:
         start = index * self.stride
         split = start + self.input_steps
         end = split + self.forecast_steps
-        return self.values[start:split], self.values[split:end]
+        return (
+            self.values[start:split],
+            self.values[split:end],
+            self.time_codes[start:split],
+            self.time_codes[split:end],
+        )
 
 
 @dataclass(frozen=True)
@@ -219,18 +234,21 @@ def load_pems_datasets(
     return PemsDatasetSplits(
         train=PemsFlowDataset(
             scaler.transform(train_values),
+            wide.index[:train_end],
             input_steps=input_steps,
             forecast_steps=forecast_steps,
             stride=stride,
         ),
         val=PemsFlowDataset(
             scaler.transform(val_values),
+            wide.index[train_end:val_end],
             input_steps=input_steps,
             forecast_steps=forecast_steps,
             stride=stride,
         ),
         test=PemsFlowDataset(
             scaler.transform(test_values),
+            wide.index[val_end:],
             input_steps=input_steps,
             forecast_steps=forecast_steps,
             stride=stride,

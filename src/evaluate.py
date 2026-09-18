@@ -68,10 +68,12 @@ def main() -> None:
     squared_error_sum = 0.0
     value_count = 0
     with torch.no_grad():
-        for features, targets in test_loader:
+        for features, targets, past_time, future_time in test_loader:
             features = torch.from_numpy(features).to(device, non_blocking=True)
             targets = torch.from_numpy(targets).to(device, non_blocking=True)
-            predictions = model(features)
+            past_time = torch.from_numpy(past_time).to(device, non_blocking=True)
+            future_time = torch.from_numpy(future_time).to(device, non_blocking=True)
+            predictions = model(features, past_time, future_time)
             # Dataset targets are normalized; report traffic-flow metrics in the
             # original units by applying the scaler fitted during training.
             errors = (predictions * scaler_std + scaler_mean) - (

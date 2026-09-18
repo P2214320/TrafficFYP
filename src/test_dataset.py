@@ -30,11 +30,13 @@ def main() -> None:
     if not len(datasets.train):
         raise RuntimeError("Smoke-test subset did not produce a training window")
 
-    x, y = datasets.train[0]
+    x, y, past_time, future_time = datasets.train[0]
     print(f"Read at most {raw_rows_for_smoke_test:,} raw rows.")
     print(f"Train samples: {len(datasets.train)}")
     print(f"X shape: {x.shape}, dtype: {x.dtype}")
     print(f"y shape: {y.shape}, dtype: {y.dtype}")
+    print(f"past_time shape: {past_time.shape}, dtype: {past_time.dtype}")
+    print(f"future_time shape: {future_time.shape}, dtype: {future_time.dtype}")
 
 
 if __name__ == "__main__":

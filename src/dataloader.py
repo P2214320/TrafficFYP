@@ -16,7 +16,7 @@ except ImportError:  # Supports `python src/dataloader.py` style imports.
 
 
 class NumpyDataLoader:
-    """Yield ``float32`` batches shaped ``[batch, time, station]``."""
+    """Yield flow and hour-of-week batches with a shared leading batch axis."""
 
     def __init__(
         self,
@@ -34,16 +34,19 @@ class NumpyDataLoader:
         self.shuffle = shuffle
         self.seed = seed
         self.drop_last = drop_last
+        self._epoch = 0
 
     def __len__(self) -> int:
         if self.drop_last:
             return len(self.dataset) // self.batch_size
         return ceil(len(self.dataset) / self.batch_size)
 
-    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    def __iter__(self) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         indices = np.arange(len(self.dataset))
         if self.shuffle:
-            np.random.default_rng(self.seed).shuffle(indices)
+            epoch_seed = None if self.seed is None else self.seed + self._epoch
+            np.random.default_rng(epoch_seed).shuffle(indices)
+            self._epoch += 1
 
         stop = len(indices)
         if self.drop_last:
@@ -51,9 +54,9 @@ class NumpyDataLoader:
         for start in range(0, stop, self.batch_size):
             batch_indices = indices[start : start + self.batch_size]
             samples = [self.dataset[int(index)] for index in batch_indices]
-            yield (
-                np.stack([sample[0] for sample in samples]).astype(np.float32, copy=False),
-                np.stack([sample[1] for sample in samples]).astype(np.float32, copy=False),
+            yield tuple(
+                np.stack([sample[position] for sample in samples]).astype(dtype, copy=False)
+                for position, dtype in enumerate((np.float32, np.float32, np.int64, np.int64))
             )
 
 
