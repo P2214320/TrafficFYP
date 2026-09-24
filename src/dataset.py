@@ -200,6 +200,19 @@ def build_station_knn(metadata: pd.DataFrame, k: int = 8) -> np.ndarray:
     return neighbors
 
 
+def build_normalized_adjacency(neighbor_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Create symmetric sparse D^-1/2 (A + I) D^-1/2 from a KNN graph."""
+    station_count = neighbor_indices.shape[0]
+    rows = np.repeat(np.arange(station_count, dtype=np.int64), neighbor_indices.shape[1])
+    cols = neighbor_indices.reshape(-1)
+    directed = np.stack((rows, cols), axis=0)
+    undirected = np.concatenate((directed, directed[::-1]), axis=1)
+    edges = np.unique(undirected, axis=1)
+    degree = np.bincount(edges[0], minlength=station_count).astype(np.float32)
+    values = 1.0 / np.sqrt(degree[edges[0]] * degree[edges[1]])
+    return edges.astype(np.int64, copy=False), values.astype(np.float32, copy=False)
+
+
 def _interpolate_within_split(values: np.ndarray) -> np.ndarray:
     """Linearly fill gaps without accessing another train/validation/test split."""
     filled = pd.DataFrame(values).interpolate(axis=0, limit_direction="both")
@@ -291,6 +304,7 @@ class PemsDatasetSplits:
     test_timestamps: pd.DatetimeIndex
     station_metadata: pd.DataFrame
     neighbor_indices: np.ndarray | None
+    normalized_adjacency: tuple[np.ndarray, np.ndarray] | None
 
 
 def load_pems_datasets(
@@ -300,6 +314,7 @@ def load_pems_datasets(
     max_raw_rows: int | None = None,
     station_limit: int | None = None,
     knn_k: int | None = None,
+    val_ratio: float = 0.15,
     input_steps: int = INPUT_STEPS,
     forecast_steps: int = FORECAST_STEPS,
     stride: int = STRIDE,
@@ -316,9 +331,11 @@ def load_pems_datasets(
         max_raw_rows=max_raw_rows,
         station_limit=station_limit,
     )
+    if not 0.0 < val_ratio < 0.80:
+        raise ValueError("val_ratio must be between 0 and 0.80")
     total_steps = len(wide)
-    train_end = int(total_steps * 0.70)
-    val_end = train_end + int(total_steps * 0.10)
+    train_end = int(total_steps * (0.80 - val_ratio))
+    val_end = int(total_steps * 0.80)
     if train_end == 0 or val_end == train_end or val_end == total_steps:
         raise ValueError("Not enough timestamps for a 70%/10%/20% split")
 
@@ -328,6 +345,9 @@ def load_pems_datasets(
 
     scaler = FlowScaler.fit(train_values)
     neighbor_indices = build_station_knn(station_metadata, knn_k) if knn_k else None
+    normalized_adjacency = (
+        build_normalized_adjacency(neighbor_indices) if neighbor_indices is not None else None
+    )
     return PemsDatasetSplits(
         train=PemsFlowDataset(
             scaler.transform(train_values),
@@ -357,4 +377,5 @@ def load_pems_datasets(
         test_timestamps=wide.index[val_end:],
         station_metadata=station_metadata,
         neighbor_indices=neighbor_indices,
+        normalized_adjacency=normalized_adjacency,
     )

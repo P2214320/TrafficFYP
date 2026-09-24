@@ -105,22 +105,94 @@ class CrossAttentionForecastBlock(nn.Module):
         return x + self.ffn_dropout(self.ffn(self.ffn_norm(x)))
 
 
-class SparseKNNMixer(nn.Module):
-    """Append the mean flow of each station's fixed sparse road neighbors."""
+class _NeighborResidualMixer(nn.Module):
+    """Base class for spatial residual mixers with an exact-safe zero start."""
+
+    def __init__(self, num_stations: int) -> None:
+        super().__init__()
+        # A station-wise linear gate is deliberately zero-initialised.  At the
+        # first update ``tanh(0)=0``, so the spatial model exactly matches the
+        # validated time-only baseline rather than perturbing every station.
+        self.gate_weight = nn.Parameter(torch.zeros(num_stations))
+        self.gate_bias = nn.Parameter(torch.zeros(num_stations))
+
+    def _apply_gate(self, inputs: Tensor, neighbor_aggregate: Tensor) -> Tensor:
+        gate = torch.tanh(neighbor_aggregate * self.gate_weight + self.gate_bias)
+        return inputs + gate * neighbor_aggregate
+
+
+class GatedKNNResidualMixer(_NeighborResidualMixer):
+    """Add a zero-gated mean of each station's fixed KNN road neighbors."""
 
     def __init__(self, neighbor_indices: Tensor) -> None:
-        super().__init__()
         indices = torch.as_tensor(neighbor_indices, dtype=torch.long)
         if indices.ndim != 2 or indices.size(1) < 2:
-            raise ValueError("neighbor_indices must have shape [station, self_plus_neighbors]")
-        self.register_buffer("neighbor_indices", indices)
+            raise ValueError("neighbor_indices must be [station, self_plus_neighbors]")
+        super().__init__(indices.size(0))
+        # Dataset graphs place self at column zero.  It must not leak into the
+        # neighbour mean, otherwise this is partly an identity transformation.
+        self.register_buffer("neighbor_indices", indices[:, 1:])
 
     def forward(self, inputs: Tensor) -> Tensor:
         if inputs.size(-1) != self.neighbor_indices.size(0):
             raise ValueError("KNN graph station count does not match model input")
-        neighbor_flows = inputs[:, :, self.neighbor_indices]
-        neighbor_mean = neighbor_flows.mean(dim=-1)
-        return torch.cat((inputs, neighbor_mean), dim=-1)
+        neighbor_mean = inputs[:, :, self.neighbor_indices].mean(dim=-1)
+        return self._apply_gate(inputs, neighbor_mean)
+
+
+class GATLiteResidualMixer(_NeighborResidualMixer):
+    """Static per-station attention over KNN neighbours, protected by a gate."""
+
+    def __init__(self, neighbor_indices: Tensor) -> None:
+        indices = torch.as_tensor(neighbor_indices, dtype=torch.long)
+        if indices.ndim != 2 or indices.size(1) < 2:
+            raise ValueError("neighbor_indices must be [station, self_plus_neighbors]")
+        super().__init__(indices.size(0))
+        self.register_buffer("neighbor_indices", indices[:, 1:])
+        # Equal logits yield a uniform KNN average at start; the zero gate keeps
+        # its contribution exactly off until optimisation finds useful signal.
+        self.attention_logits = nn.Parameter(torch.zeros_like(indices[:, 1:], dtype=torch.float32))
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.size(-1) != self.neighbor_indices.size(0):
+            raise ValueError("KNN graph station count does not match model input")
+        neighbor_values = inputs[:, :, self.neighbor_indices]
+        weights = torch.softmax(self.attention_logits, dim=-1)
+        neighbor_aggregate = (neighbor_values * weights).sum(dim=-1)
+        return self._apply_gate(inputs, neighbor_aggregate)
+
+
+class GCNLiteResidualMixer(_NeighborResidualMixer):
+    """Sparse normalized graph aggregation followed by the same safe gate."""
+
+    def __init__(
+        self, num_stations: int, adjacency_indices: Tensor, adjacency_values: Tensor
+    ) -> None:
+        super().__init__(num_stations)
+        indices = torch.as_tensor(adjacency_indices, dtype=torch.long)
+        values = torch.as_tensor(adjacency_values, dtype=torch.float32)
+        if indices.ndim != 2 or indices.shape[0] != 2 or indices.shape[1] != values.numel():
+            raise ValueError("Sparse adjacency must have indices [2, edges] and matching values")
+        self.register_buffer("adjacency_indices", indices)
+        self.register_buffer("adjacency_values", values)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if inputs.size(-1) != self.gate_weight.numel():
+            raise ValueError("GCN graph station count does not match model input")
+        # CUDA sparse.mm has no float16 kernel.  Keep this small graph-only
+        # operation in float32 while the attention/FFN remains AMP-enabled.
+        with torch.autocast(device_type=inputs.device.type, enabled=False):
+            adjacency = torch.sparse_coo_tensor(
+                self.adjacency_indices,
+                self.adjacency_values,
+                (inputs.size(-1), inputs.size(-1)),
+                device=inputs.device,
+            ).coalesce()
+            # sparse.mm aggregates every station for all B*T observations at once.
+            values = inputs.float().permute(2, 0, 1).reshape(inputs.size(-1), -1)
+            aggregate = torch.sparse.mm(adjacency, values)
+        neighbor_aggregate = aggregate.reshape(inputs.size(-1), inputs.size(0), inputs.size(1)).permute(1, 2, 0)
+        return self._apply_gate(inputs, neighbor_aggregate)
 
 
 class TrafficTransformer(nn.Module):
@@ -137,7 +209,10 @@ class TrafficTransformer(nn.Module):
         num_encoder_layers: int = 3,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
+        spatial_mode: str = "none",
         neighbor_indices: Tensor | None = None,
+        adjacency_indices: Tensor | None = None,
+        adjacency_values: Tensor | None = None,
     ) -> None:
         super().__init__()
         if min(num_stations, input_steps, forecast_steps, num_encoder_layers) <= 0:
@@ -148,11 +223,27 @@ class TrafficTransformer(nn.Module):
         self.num_stations = num_stations
         self.input_steps = input_steps
         self.forecast_steps = forecast_steps
-        self.spatial_mixer = (
-            SparseKNNMixer(neighbor_indices) if neighbor_indices is not None else None
-        )
-        input_features = num_stations * (2 if self.spatial_mixer is not None else 1)
-        self.input_projection = nn.Linear(input_features, d_model)
+        valid_spatial_modes = {"none", "gated_knn", "gat_lite", "gcn_lite"}
+        if spatial_mode not in valid_spatial_modes:
+            raise ValueError(f"spatial_mode must be one of {sorted(valid_spatial_modes)}")
+        self.spatial_mode = spatial_mode
+        if spatial_mode == "none":
+            self.spatial_mixer: nn.Module | None = None
+        elif spatial_mode == "gated_knn":
+            if neighbor_indices is None:
+                raise ValueError("gated_knn requires neighbor_indices")
+            self.spatial_mixer = GatedKNNResidualMixer(neighbor_indices)
+        elif spatial_mode == "gat_lite":
+            if neighbor_indices is None:
+                raise ValueError("gat_lite requires neighbor_indices")
+            self.spatial_mixer = GATLiteResidualMixer(neighbor_indices)
+        else:
+            if adjacency_indices is None or adjacency_values is None:
+                raise ValueError("gcn_lite requires sparse normalized adjacency")
+            self.spatial_mixer = GCNLiteResidualMixer(
+                num_stations, adjacency_indices, adjacency_values
+            )
+        self.input_projection = nn.Linear(num_stations, d_model)
         self.hour_embedding = nn.Embedding(24, 8)
         self.day_embedding = nn.Embedding(7, 4)
         self.time_projection = nn.Linear(12, d_model)

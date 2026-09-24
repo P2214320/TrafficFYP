@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from copy import deepcopy
 from pathlib import Path
@@ -24,6 +25,7 @@ except ImportError:  # Supports `python src/train.py`.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_PATH = PROJECT_ROOT / "data" / "data_processed" / "pems_la.csv"
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "best_model.pth"
+PROTECTED_TIME_ONLY_PATH = PROJECT_ROOT / "models" / "best_model_time_only.pth"
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -92,15 +94,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4, help="Use 4 on a 6 GB RTX 3060.")
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--station-limit", type=int, default=None, help="Use 5 for a mini run.")
     parser.add_argument(
+        "--val-ratio", type=float, default=0.15,
+        help="Validation proportion; train is 0.80 - val-ratio and test is 0.20.",
+    )
+    parser.add_argument(
+        "--spatial-mode", choices=("none", "gated_knn", "gat_lite", "gcn_lite"), default="none"
+    )
+    parser.add_argument(
         "--knn-k",
         type=int,
-        default=0,
-        help="Sparse road-neighbor count (experimental); use 8 to enable.",
+        default=8,
+        help="Road-neighbor count for a spatial experiment (default: 8).",
+    )
+    parser.add_argument(
+        "--experiment-name", default=None,
+        help="Optional name used for a JSON epoch history under experiments/logs/.",
     )
     parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
     parser.add_argument("--seed", type=int, default=42)
@@ -111,17 +124,28 @@ def main() -> None:
     args = parse_args()
     if min(args.epochs, args.batch_size, args.patience) <= 0:
         raise ValueError("epochs, batch_size, and patience must be positive")
+    if not 0.0 < args.val_ratio < 0.8:
+        raise ValueError("val_ratio must lie between 0 and 0.8")
+    if args.spatial_mode != "none" and args.knn_k <= 0:
+        raise ValueError("A spatial experiment requires --knn-k > 0")
+    if args.model_path.resolve() == PROTECTED_TIME_ONLY_PATH.resolve():
+        raise ValueError(
+            "Refusing to overwrite models/best_model_time_only.pth; choose a separate model path."
+        )
 
     set_seed(args.seed)
     device = resolve_device(args.device)
-    knn_k = args.knn_k or None
+    knn_k = args.knn_k if args.spatial_mode != "none" else None
     datasets = load_pems_datasets(
-        args.data_path, station_limit=args.station_limit, knn_k=knn_k
+        args.data_path,
+        station_limit=args.station_limit,
+        knn_k=knn_k,
+        val_ratio=args.val_ratio,
     )
     if not len(datasets.train) or not len(datasets.val):
         raise ValueError(
             "Train/validation windows are empty. Keep the full time range; a "
-            "three-day subset is too short after a 70%/10%/20% split."
+            "three-day subset is too short after the chronological split."
         )
 
     train_loader = NumpyDataLoader(
@@ -138,9 +162,21 @@ def main() -> None:
         "num_encoder_layers": 3,
         "dim_feedforward": 512,
         "dropout": 0.1,
+        "spatial_mode": args.spatial_mode,
     }
     model = build_traffic_transformer(
-        **model_config, neighbor_indices=datasets.neighbor_indices
+        **model_config,
+        neighbor_indices=datasets.neighbor_indices,
+        adjacency_indices=(
+            datasets.normalized_adjacency[0]
+            if datasets.normalized_adjacency is not None
+            else None
+        ),
+        adjacency_values=(
+            datasets.normalized_adjacency[1]
+            if datasets.normalized_adjacency is not None
+            else None
+        ),
     ).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(
@@ -151,6 +187,14 @@ def main() -> None:
     )
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path = (
+        PROJECT_ROOT / "experiments" / "logs" / f"{args.experiment_name}_train.json"
+        if args.experiment_name
+        else None
+    )
+    if history_path is not None:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+    history: list[dict[str, float | int]] = []
     epochs_without_improvement = 0
     amp_enabled = device.type == "cuda"
     gradient_scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -159,18 +203,22 @@ def main() -> None:
     # Preserve that safe checkpoint unless training genuinely improves on it.
     best_val_loss = baseline_val_loss
     best_state: dict[str, torch.Tensor] | None = deepcopy(model.state_dict())
-    torch.save(
-        {
-            "model_state_dict": best_state,
+    def checkpoint_payload(state: dict[str, torch.Tensor], val_mse: float) -> dict[str, object]:
+        return {
+            "model_state_dict": state,
             "model_config": model_config,
-            "data_config": {"station_limit": args.station_limit, "knn_k": knn_k},
+            "data_config": {
+                "station_limit": args.station_limit,
+                "knn_k": knn_k,
+                "val_ratio": args.val_ratio,
+            },
             "station_ids": datasets.station_ids,
             "scaler_mean": datasets.scaler.mean,
             "scaler_std": datasets.scaler.std,
-            "best_val_mse": best_val_loss,
-        },
-        args.model_path,
-    )
+            "best_val_mse": val_mse,
+        }
+
+    torch.save(checkpoint_payload(best_state, best_val_loss), args.model_path)
 
     print(
         f"Device: {device}; stations: {len(datasets.station_ids)}; "
@@ -207,23 +255,23 @@ def main() -> None:
             f"val_mse={val_loss:.6f}, baseline_mse={baseline_val_loss:.6f}, "
             f"lr={learning_rate:.2e}"
         )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_mse": train_loss,
+                "val_mse": val_loss,
+                "baseline_val_mse": baseline_val_loss,
+                "learning_rate": learning_rate,
+            }
+        )
+        if history_path is not None:
+            history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = deepcopy(model.state_dict())
             epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state_dict": best_state,
-                    "model_config": model_config,
-                    "data_config": {"station_limit": args.station_limit, "knn_k": knn_k},
-                    "station_ids": datasets.station_ids,
-                    "scaler_mean": datasets.scaler.mean,
-                    "scaler_std": datasets.scaler.std,
-                    "best_val_mse": best_val_loss,
-                },
-                args.model_path,
-            )
+            torch.save(checkpoint_payload(best_state, best_val_loss), args.model_path)
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= args.patience:
@@ -232,6 +280,8 @@ def main() -> None:
 
     print(f"Best validation MSE: {best_val_loss:.6f}")
     print(f"Saved checkpoint: {args.model_path}")
+    if history_path is not None:
+        print(f"Epoch history: {history_path}")
 
 
 if __name__ == "__main__":
