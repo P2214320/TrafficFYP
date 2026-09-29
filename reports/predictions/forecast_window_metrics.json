@@ -1,0 +1,14 @@
+{
+  "checkpoint": "models\\best_model_time_only.pth",
+  "window_index": 112,
+  "selected_station_ids": [
+    "715898",
+    "760361",
+    "777796"
+  ],
+  "forecast_steps": 144,
+  "model_mae": 72.28559112548828,
+  "model_rmse": 118.82328033447266,
+  "baseline_mae": 70.94213104248047,
+  "baseline_rmse": 117.39295196533203
+}
